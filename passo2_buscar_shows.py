@@ -64,6 +64,12 @@ TEMPO_MAX_SEGUNDOS = 45 * 60
 # Cota diária do Google CSE (free tier = 100 buscas/dia).
 CSE_ORCAMENTO_DIARIO = 100
 
+# Estratégia híbrida por prioridade: os N primeiros artistas (os mais ouvidos)
+# usam o Google (mais assertivo), trazendo os CSE_RESULTADOS melhores resultados.
+# Os demais artistas usam o ddgs. Assim priorizamos os favoritos e poupamos cota.
+NUM_ARTISTAS_GOOGLE = 20
+CSE_RESULTADOS      = 3
+
 PAUSA_BUSCA      = 3     # segundos entre buscas no ddgs (fallback)
 MIN_INTERVALO_IA = 5     # segundos entre chamadas de IA (respeita free tier)
 MAX_RETRIES_IA   = 3     # tentativas por artista antes de desistir (sem travar)
@@ -162,12 +168,10 @@ def coletar_google_cse(nome, estado):
     Busca via Google Custom Search JSON API.
     Retorna lista de candidatos, ou None se a cota/credencial falhar
     (nesse caso o chamador desliga o CSE e usa o ddgs).
-    A primeira query espelha a busca que o usuario faz no Google.
+    A query espelha a busca que o usuario faz no Google e traz os
+    CSE_RESULTADOS melhores resultados.
     """
-    queries = [
-        f'{nome} show sp',
-        f'{nome} show São Paulo ingressos {ANO_ATUAL}',
-    ]
+    queries = [f'{nome} show sp']
     candidatos, vistos = [], set()
 
     for q in queries:
@@ -178,7 +182,7 @@ def coletar_google_cse(nome, estado):
                 "https://www.googleapis.com/customsearch/v1",
                 params={
                     "key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": q,
-                    "num": 10, "gl": "br", "hl": "pt-BR",
+                    "num": CSE_RESULTADOS, "gl": "br", "hl": "pt-BR",
                 },
                 timeout=20,
             )
@@ -245,14 +249,22 @@ def coletar_web_ddg(ddgs, nome):
     return candidatos[:MAX_RESULTADOS_POR_ARTISTA]
 
 
-def coletar_candidatos(nome, ddgs, estado):
-    """Escolhe a fonte: CSE se disponivel, senao ddgs."""
-    if estado["usar_cse"] and estado["budget"] > 0:
+def coletar_candidatos(nome, indice, ddgs, estado):
+    """
+    Estratégia híbrida por prioridade:
+      - os NUM_ARTISTAS_GOOGLE primeiros (mais ouvidos) usam o Google (CSE);
+      - os demais usam o ddgs.
+    Se o CSE falhar/estourar a cota, cai no ddgs automaticamente.
+    Retorna (candidatos, motor_usado).
+    """
+    usa_google = (indice <= NUM_ARTISTAS_GOOGLE
+                  and estado["usar_cse"] and estado["budget"] > 0)
+    if usa_google:
         cand = coletar_google_cse(nome, estado)
         if cand is not None:
-            return cand
+            return cand, "Google"
         estado["usar_cse"] = False   # CSE falhou -> daqui pra frente usa ddgs
-    return coletar_web_ddg(ddgs, nome)
+    return coletar_web_ddg(ddgs, nome), "ddgs"
 
 
 # --- FONTE 3: Bandsintown (opcional) ------------------------------
@@ -471,7 +483,10 @@ def main():
     print(f"  Somente shows futuros a partir de {HOJE_STR}")
     ia = "Gemini (%s)" % GEMINI_MODEL if GEMINI_API_KEY else ("Groq llama-3.3" if GROQ_API_KEY else "NENHUMA")
     print(f"  IA: {ia}")
-    print(f"  Busca: {'Google Custom Search (real)' if usar_cse else 'ddgs (fallback sem chave)'}")
+    if usar_cse:
+        print(f"  Busca: Google (top {NUM_ARTISTAS_GOOGLE} artistas) + ddgs (demais)")
+    else:
+        print("  Busca: ddgs (Google CSE nao configurado)")
     print(f"  Bandsintown: {'ativada' if BANDSINTOWN_APP_ID else 'desativada'}")
     print("=" * 64)
     print()
@@ -510,8 +525,8 @@ def main():
 
             print(f"  [{i:2}/{len(artistas)}] {nome}...", end=" ", flush=True)
 
-            shows_bt   = coletar_bandsintown(nome)
-            candidatos = coletar_candidatos(nome, ddgs, estado)
+            shows_bt          = coletar_bandsintown(nome)
+            candidatos, motor = coletar_candidatos(nome, i, ddgs, estado)
             corpus = " ".join(f"{c['titulo']} {c['snippet']} {c['link']}" for c in candidatos)
 
             shows_web = validar(extrair_shows_ia(nome, candidatos), corpus) if candidatos else []
@@ -519,11 +534,11 @@ def main():
 
             achados = deduplicar(shows_bt + shows_web)
             if achados:
-                print(f"-> {len(achados)} show(s)")
+                print(f"-> [{motor}] {len(achados)} show(s)")
                 for s in achados:
                     print(f"        - {s.get('data', '?')} | {s.get('local', '')} | {s.get('fonte', '')}")
             else:
-                print("-> -")
+                print(f"-> [{motor}] -")
 
             todos.extend(achados)
             time.sleep(MIN_INTERVALO_IA)   # ritmo que respeita o free tier da IA
