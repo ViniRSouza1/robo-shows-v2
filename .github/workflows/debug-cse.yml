@@ -1,0 +1,20 @@
+name: Debug CSE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Testar Google Custom Search
+        run: |
+          echo "Testando CSE (as chaves aparecem mascaradas como ***)..."
+          code=$(curl -s -o resp.json -w "%{http_code}" \
+            "https://www.googleapis.com/customsearch/v1?key=${{ secrets.GOOGLE_API_KEY }}&cx=${{ secrets.GOOGLE_CSE_ID }}&q=thiago+espirito+santo+show+sp&num=3&gl=br&hl=pt-BR")
+          echo "HTTP_STATUS=$code"
+          echo "----- corpo da resposta -----"
+          cat resp.json
+          echo ""
+          echo "----- links retornados (se sucesso) -----"
+          python3 -c "import json; d=json.load(open('resp.json')); items=d.get('items',[]); print('\n'.join(i.get('link','') for i in items)) if items else print('(sem items)')" 2>/dev/null || echo "(nao foi possivel parsear)"
