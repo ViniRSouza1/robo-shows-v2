@@ -187,10 +187,13 @@ def coletar_google_cse(nome, estado):
                 timeout=20,
             )
             estado["budget"] -= 1
-            if r.status_code in (403, 429):   # cota diaria ou credencial invalida
-                print("(CSE cota/erro->ddgs)", end="", flush=True)
+            if r.status_code != 200:   # cota, credencial invalida, API desativada...
+                try:
+                    motivo = r.json().get("error", {}).get("message", "")[:180]
+                except Exception:
+                    motivo = r.text[:180]
+                print(f"(CSE HTTP {r.status_code}: {motivo} -> ddgs)", end="", flush=True)
                 return None
-            r.raise_for_status()
             items = r.json().get("items", []) or []
         except Exception:
             continue
