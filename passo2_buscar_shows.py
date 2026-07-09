@@ -1,28 +1,26 @@
 """
 PASSO 2 (v2) — Descoberta multi-fonte de shows futuros em São Paulo
 ===================================================================
-Objetivo desta versão: MAXIMIZAR o recall (achar o máximo de shows futuros
-possível), corrigindo as duas falhas de recall da v1:
+Objetivo: MAXIMIZAR o recall (achar o máximo de shows futuros possível) sem
+travar por rate limit / timeout.
 
-  1. NÃO filtra mais os resultados para uma whitelist fixa de sites.
-     Qualquer site (Ingresse, casas de show, imprensa, etc.) pode entrar.
-  2. NÃO descarta mais "páginas de artista" — elas normalmente contêm
-     justamente a data do show.
-
-Fontes:
-  - DuckDuckGo (ddgs): busca ampla, sem chave, 100% grátis. Fonte principal.
-  - Bandsintown API: OPCIONAL. Só é usada se BANDSINTOWN_APP_ID estiver
-    definido (o endpoint público nega app_id arbitrário — precisa de um
-    app_id registrado). Deixada pronta para quando você registrar.
+Fontes de busca (em ordem de preferência):
+  1. Google Custom Search JSON API  -> se GOOGLE_API_KEY + GOOGLE_CSE_ID
+     estiverem definidos. Retorna resultados REAIS do Google (a mesma
+     cobertura que voce ve no navegador), 100 buscas/dia gratis, sem cartao.
+     E a fonte mais confiavel para achar eventos pequenos (ex.: Sympla).
+  2. DuckDuckGo/Bing/Brave (biblioteca ddgs) -> fallback automatico, sem chave,
+     usado quando o CSE nao esta configurado ou estoura a cota diaria.
 
 IA de extração/validação (100% gratuita, escolhida automaticamente):
-  - Google Gemini 2.5 Flash  (se GEMINI_API_KEY existir) — preferida:
-    contexto grande (lê muitos resultados de uma vez) e melhor raciocínio
-    de datas.
-  - Groq llama-3.3-70b       (fallback, se só GROQ_API_KEY existir).
+  - Google Gemini (se GEMINI_API_KEY existir) — preferida.
+  - Groq llama-3.3-70b (fallback, se só GROQ_API_KEY existir).
 
-A IA extrai shows futuros em SP; uma trava em Python garante que o ano não
-foi inventado/avançado (ancoragem do ano nas fontes).
+Blindagens contra timeout (o que quebrou a execucao anterior):
+  - Backoff de rate limit curto e com desistencia (nao trava 5 min por artista).
+  - Orcamento GLOBAL de tempo: ao se aproximar do limite, encerra a busca e
+    ainda assim salva o que encontrou (garante que o Passo 3 rode e notifique).
+  - O arquivo de saida e sempre gravado, mesmo com resultado parcial.
 
 Dependências:
     pip install ddgs requests groq python-dotenv
@@ -53,23 +51,33 @@ TOP_N = 50
 
 ARTISTAS_MANUAIS = ["Thiago Espírito Santo", "Fresno", "Terno Rei"]
 
-# Resultados de busca por artista (mais = recall maior, porém mais lento e
-# mais risco de rate limit no DuckDuckGo).
-MAX_RESULTADOS_POR_ARTISTA = 24
+# Resultados de busca por artista (mais = recall maior).
+MAX_RESULTADOS_POR_ARTISTA = 20
 
 # Janela máxima de antecedência aceita (evita datas empurradas pro futuro).
 DIAS_MAX_FUTURO = 540    # ~18 meses
 
-PAUSA_BUSCA = 3          # segundos entre buscas no DuckDuckGo
-PAUSA_IA    = 4          # segundos entre chamadas de IA
-MAX_RETRIES = 5
+# Orçamento GLOBAL de tempo. Ao ultrapassar, encerra a busca e salva o que
+# encontrou (o job do GitHub tem timeout de 60 min; ficamos com folga).
+TEMPO_MAX_SEGUNDOS = 45 * 60
+
+# Cota diária do Google CSE (free tier = 100 buscas/dia).
+CSE_ORCAMENTO_DIARIO = 100
+
+PAUSA_BUSCA      = 3     # segundos entre buscas no ddgs (fallback)
+MIN_INTERVALO_IA = 5     # segundos entre chamadas de IA (respeita free tier)
+MAX_RETRIES_IA   = 3     # tentativas por artista antes de desistir (sem travar)
 
 # ==================================================================
 
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL       = "gemini-2.5-flash"
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
-GROQ_MODEL         = "llama-3.3-70b-versatile"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL   = "gemini-2.5-flash-lite"   # limites free maiores que o flash
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_MODEL     = "llama-3.3-70b-versatile"
+
 BANDSINTOWN_APP_ID = os.getenv("BANDSINTOWN_APP_ID")   # opcional
 
 ARTISTAS_FILE = "artistas_favoritos.json"
@@ -89,6 +97,7 @@ FONTES_CONHECIDAS = {
     "ticket360.com.br":     "Ticket360",
     "ticketmaster.com.br":  "Ticketmaster",
     "clubedoingresso.com":  "Clube do Ingresso",
+    "uhuu.com":             "Uhuu",
     "bandsintown.com":      "Bandsintown",
     "songkick.com":         "Songkick",
 }
@@ -146,32 +155,80 @@ def carregar_artistas():
     return [a["nome"] for a in artistas]
 
 
-# --- FONTE 1: DuckDuckGo (ampla, sem whitelist) -------------------
+# --- FONTE 1: Google Custom Search (resultados reais do Google) ----
+
+def coletar_google_cse(nome, estado):
+    """
+    Busca via Google Custom Search JSON API.
+    Retorna lista de candidatos, ou None se a cota/credencial falhar
+    (nesse caso o chamador desliga o CSE e usa o ddgs).
+    A primeira query espelha a busca que o usuario faz no Google.
+    """
+    queries = [
+        f'{nome} show sp',
+        f'{nome} show São Paulo ingressos {ANO_ATUAL}',
+    ]
+    candidatos, vistos = [], set()
+
+    for q in queries:
+        if estado["budget"] <= 0:
+            break
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={
+                    "key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": q,
+                    "num": 10, "gl": "br", "hl": "pt-BR",
+                },
+                timeout=20,
+            )
+            estado["budget"] -= 1
+            if r.status_code in (403, 429):   # cota diaria ou credencial invalida
+                print("(CSE cota/erro->ddgs)", end="", flush=True)
+                return None
+            r.raise_for_status()
+            items = r.json().get("items", []) or []
+        except Exception:
+            continue
+
+        for it in items:
+            link = it.get("link", "")
+            if not link or link in vistos:
+                continue
+            vistos.add(link)
+            candidatos.append({
+                "titulo":  it.get("title", ""),
+                "snippet": it.get("snippet", ""),
+                "link":    link,
+                "fonte":   nome_fonte(link),
+            })
+
+    return candidatos[:MAX_RESULTADOS_POR_ARTISTA]
+
+
+# --- FONTE 2: ddgs (fallback sem chave) ---------------------------
 
 def coletar_web_ddg(ddgs, nome):
     queries = [
         f'show "{nome}" "São Paulo" {ANO_ATUAL} ingresso',
-        f'show "{nome}" "São Paulo" {ANO_PROX} ingresso',
         f'"{nome}" show São Paulo site:sympla.com.br',
         f'"{nome}" show São Paulo site:eventim.com.br',
-        f'"{nome}" show São Paulo site:ingresse.com',
     ]
-
-    candidatos = []
-    vistos = set()
+    candidatos, vistos = [], set()
 
     for query in queries:
         if len(candidatos) >= MAX_RESULTADOS_POR_ARTISTA:
             break
-        try:
-            items = list(ddgs.text(query, max_results=8, region="br-pt"))
-        except Exception as e:
-            msg = str(e).lower()
-            if "ratelimit" in msg or "429" in msg:
-                print("(DDG 30s)", end="", flush=True)
-                time.sleep(30)
-            continue
-
+        for backend in ("duckduckgo", "bing", "brave"):
+            try:
+                items = list(ddgs.text(query, max_results=8,
+                                       backend=backend, region="br-pt"))
+                break   # deu certo com este backend
+            except Exception as e:
+                msg = str(e).lower()
+                if "ratelimit" in msg or "429" in msg:
+                    time.sleep(5)
+                items = []
         for item in items:
             link = item.get("href", "")
             if not link or link in vistos:
@@ -188,7 +245,17 @@ def coletar_web_ddg(ddgs, nome):
     return candidatos[:MAX_RESULTADOS_POR_ARTISTA]
 
 
-# --- FONTE 2: Bandsintown (opcional) ------------------------------
+def coletar_candidatos(nome, ddgs, estado):
+    """Escolhe a fonte: CSE se disponivel, senao ddgs."""
+    if estado["usar_cse"] and estado["budget"] > 0:
+        cand = coletar_google_cse(nome, estado)
+        if cand is not None:
+            return cand
+        estado["usar_cse"] = False   # CSE falhou -> daqui pra frente usa ddgs
+    return coletar_web_ddg(ddgs, nome)
+
+
+# --- FONTE 3: Bandsintown (opcional) ------------------------------
 
 def coletar_bandsintown(nome):
     if not BANDSINTOWN_APP_ID:
@@ -209,8 +276,7 @@ def coletar_bandsintown(nome):
     limite = HOJE + timedelta(days=DIAS_MAX_FUTURO)
     for ev in dados:
         venue = ev.get("venue", {}) or {}
-        cidade = f"{venue.get('city', '')} {venue.get('region', '')}"
-        if not eh_sao_paulo(cidade):
+        if not eh_sao_paulo(f"{venue.get('city', '')} {venue.get('region', '')}"):
             continue
         try:
             d = datetime.fromisoformat(ev.get("datetime", "")).date()
@@ -219,16 +285,15 @@ def coletar_bandsintown(nome):
         if d <= HOJE or d > limite:
             continue
         offers = ev.get("offers", []) or []
-        link = offers[0].get("url", "") if offers else ev.get("url", "")
         shows.append({
             "artista":   nome,
             "titulo":    ev.get("title", "") or f"{nome} em São Paulo",
             "data":      d.strftime("%d/%m/%Y"),
             "local":     f"{venue.get('name', '')}, São Paulo".strip(", "),
             "preco":     "",
-            "link":      link,
+            "link":      offers[0].get("url", "") if offers else ev.get("url", ""),
             "fonte":     "Bandsintown",
-            "_confiavel": True,   # data já vem estruturada e com ano correto
+            "_confiavel": True,
         })
     return shows
 
@@ -259,8 +324,11 @@ REGRAS OBRIGATÓRIAS:
    Se a data não tiver ANO explícito, DESCARTE o show.
 2. FUTURO: inclua só shows com data estritamente posterior a {HOJE_STR}.
 3. CIDADE: só São Paulo capital. Descarte outras cidades (mesmo no estado de SP).
-4. ARTISTA CERTO: shows do próprio "{nome}" (ou tributo onde ele é o homenageado).
-   Descarte banda cover tocando repertório de outro artista, ou ele só como abertura.
+4. ARTISTA PRESENTE: inclua shows em que "{nome}" realmente toca — como atração
+   principal, em dupla/trio/coletivo, OU dividindo a noite com outros artistas.
+   Exemplo que DEVE ser incluído: "Fulano, Ciclano & {nome} no Fino da Bossa".
+   Descarte SOMENTE: banda cover/tributo tocando repertório de OUTRO artista sem
+   a presença de "{nome}", ou "{nome}" citado por acaso sem tocar no evento.
 5. DUPLICATAS: um show por entrada.
 
 Resultados:
@@ -298,13 +366,14 @@ def chamar_groq(prompt):
 
 
 def extrair_shows_ia(nome, candidatos):
+    """Extrai shows via IA. Backoff CURTO e desiste sem travar a execucao."""
     if not candidatos:
         return []
     prompt = montar_prompt(nome, candidatos)
     usar_gemini = bool(GEMINI_API_KEY)
     texto = ""
 
-    for tentativa in range(1, MAX_RETRIES + 1):
+    for tentativa in range(1, MAX_RETRIES_IA + 1):
         try:
             texto = chamar_gemini(prompt) if usar_gemini else chamar_groq(prompt)
             texto = (texto or "").strip()
@@ -318,9 +387,10 @@ def extrair_shows_ia(nome, candidatos):
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
             if code == 429:
-                espera = 20 * tentativa
-                print(f"(IA {espera}s)", end="", flush=True)
-                time.sleep(espera)
+                if tentativa >= MAX_RETRIES_IA:
+                    print("(IA rate limit: pulando)", end="", flush=True)
+                    return []          # desiste do artista, NAO trava a execucao
+                time.sleep(8 * tentativa)   # 8s, 16s — curto
                 continue
             if usar_gemini and GROQ_API_KEY:   # Gemini falhou -> cai pro Groq
                 usar_gemini = False
@@ -380,16 +450,29 @@ def deduplicar(shows):
     return unicos
 
 
+def salvar(shows):
+    def chave_ordem(s):
+        try:
+            return datetime.strptime(s.get("data", ""), "%d/%m/%Y")
+        except Exception:
+            return datetime.max
+    shows = sorted(shows, key=chave_ordem)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(shows, f, ensure_ascii=False, indent=2)
+    return shows
+
+
 # --- Main ---------------------------------------------------------
 
 def main():
+    usar_cse = bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
     print("=" * 64)
     print("  ROBO DE SHOWS v2 — PASSO 2: descoberta multi-fonte")
     print(f"  Somente shows futuros a partir de {HOJE_STR}")
-    ia = "Gemini 2.5 Flash" if GEMINI_API_KEY else ("Groq llama-3.3" if GROQ_API_KEY else "NENHUMA")
+    ia = "Gemini (%s)" % GEMINI_MODEL if GEMINI_API_KEY else ("Groq llama-3.3" if GROQ_API_KEY else "NENHUMA")
     print(f"  IA: {ia}")
-    bt = "ativada" if BANDSINTOWN_APP_ID else "desativada (defina BANDSINTOWN_APP_ID)"
-    print(f"  Bandsintown: {bt}")
+    print(f"  Busca: {'Google Custom Search (real)' if usar_cse else 'ddgs (fallback sem chave)'}")
+    print(f"  Bandsintown: {'ativada' if BANDSINTOWN_APP_ID else 'desativada'}")
     print("=" * 64)
     print()
 
@@ -411,20 +494,28 @@ def main():
 
     print(f"  {len(artistas)} artistas na fila\n")
 
+    estado = {"usar_cse": usar_cse, "budget": CSE_ORCAMENTO_DIARIO}
     todos = []
+    inicio = time.monotonic()
+    interrompido = False
+
     with DDGS() as ddgs:
         for i, nome in enumerate(artistas, 1):
+            # Orçamento global de tempo: encerra e salva o que já tem.
+            if time.monotonic() - inicio > TEMPO_MAX_SEGUNDOS:
+                print(f"\n  ⏱ Tempo máximo atingido — encerrando busca "
+                      f"(processados {i-1}/{len(artistas)}). Salvando o que foi encontrado.")
+                interrompido = True
+                break
+
             print(f"  [{i:2}/{len(artistas)}] {nome}...", end=" ", flush=True)
 
-            shows_bt = coletar_bandsintown(nome)          # fonte estruturada (opcional)
-            candidatos = coletar_web_ddg(ddgs, nome)       # fonte web ampla
+            shows_bt   = coletar_bandsintown(nome)
+            candidatos = coletar_candidatos(nome, ddgs, estado)
             corpus = " ".join(f"{c['titulo']} {c['snippet']} {c['link']}" for c in candidatos)
 
-            shows_web = []
-            if candidatos:
-                shows_web = validar(extrair_shows_ia(nome, candidatos), corpus)
-
-            shows_bt = validar(shows_bt, corpus)
+            shows_web = validar(extrair_shows_ia(nome, candidatos), corpus) if candidatos else []
+            shows_bt  = validar(shows_bt, corpus)
 
             achados = deduplicar(shows_bt + shows_web)
             if achados:
@@ -435,25 +526,18 @@ def main():
                 print("-> -")
 
             todos.extend(achados)
-            time.sleep(PAUSA_IA)
+            time.sleep(MIN_INTERVALO_IA)   # ritmo que respeita o free tier da IA
 
     todos = deduplicar(todos)
-
-    def chave_ordem(s):
-        try:
-            return datetime.strptime(s.get("data", ""), "%d/%m/%Y")
-        except Exception:
-            return datetime.max
-    todos.sort(key=chave_ordem)
+    todos = salvar(todos)
 
     print(f"\n{'-' * 64}")
-    print(f"{len(todos)} shows futuros unicos em Sao Paulo")
+    status = "PARCIAL (interrompido por tempo)" if interrompido else "completo"
+    print(f"{len(todos)} shows futuros unicos em Sao Paulo — resultado {status}")
     print(f"{'-' * 64}")
     for s in todos:
         print(f"  {s.get('artista', ''):<25} | {s.get('data', ''):<12} | {s.get('local', '')}")
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(todos, f, ensure_ascii=False, indent=2)
     print(f"\nSalvo em {OUTPUT_FILE}\nPasso 2 concluido.\n")
 
 

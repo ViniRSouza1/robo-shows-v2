@@ -61,3 +61,18 @@ Configure os secrets no repositorio: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET
 - `MAX_RESULTADOS_POR_ARTISTA`: mais resultados = mais recall, porem mais lento.
 - `DIAS_MAX_FUTURO`: janela maxima de antecedencia aceita (~18 meses).
 - `PAUSA_BUSCA` / `PAUSA_IA`: pausas para evitar rate limit.
+
+## Busca via Google Custom Search (recomendado para recall)
+
+O `ddgs` (DuckDuckGo/Bing/Brave) tem cobertura pior que o Google real e perde
+eventos pequenos (ex.: shows em casas menores no Sympla). Para igualar o que
+voce ve no Google, configure a **Google Custom Search JSON API** (gratis, 100
+buscas/dia, sem cartao):
+
+1. **API key:** https://console.cloud.google.com/apis/credentials -> crie uma
+   API key e ative a "Custom Search API" no projeto.
+2. **Search engine (cx):** https://programmablesearchengine.google.com -> crie
+   um mecanismo, marque **"Pesquisar em toda a web"**, copie o **ID do mecanismo**.
+3. Preencha `GOOGLE_API_KEY` e `GOOGLE_CSE_ID` no `.env` (ou nos secrets do repo).
+
+Sem essas variaveis, o robo continua funcionando via ddgs (fallback automatico).
