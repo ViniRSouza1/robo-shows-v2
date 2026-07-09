@@ -76,15 +76,20 @@ MAX_RETRIES_IA   = 3     # tentativas por artista antes de desistir (sem travar)
 
 # ==================================================================
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID")
+def _env(nome):
+    """Lê variável de ambiente removendo espaços/quebras de linha acidentais
+    (secrets colados com newline quebram URLs e invalidam chaves de API)."""
+    return (os.getenv(nome) or "").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = _env("GOOGLE_API_KEY")
+GOOGLE_CSE_ID  = _env("GOOGLE_CSE_ID")
+
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
 GEMINI_MODEL   = "gemini-2.5-flash-lite"   # limites free maiores que o flash
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY   = _env("GROQ_API_KEY")
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 
-BANDSINTOWN_APP_ID = os.getenv("BANDSINTOWN_APP_ID")   # opcional
+BANDSINTOWN_APP_ID = _env("BANDSINTOWN_APP_ID")   # opcional
 
 ARTISTAS_FILE = "artistas_favoritos.json"
 OUTPUT_FILE   = "shows_encontrados.json"
