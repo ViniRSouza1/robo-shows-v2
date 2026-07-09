@@ -68,7 +68,7 @@ CSE_ORCAMENTO_DIARIO = 100
 # usam o Google (mais assertivo), trazendo os CSE_RESULTADOS melhores resultados.
 # Os demais artistas usam o ddgs. Assim priorizamos os favoritos e poupamos cota.
 NUM_ARTISTAS_GOOGLE = 20
-CSE_RESULTADOS      = 3
+CSE_RESULTADOS      = 5   # resultados por artista no Google (1 query = 1 unid. de cota)
 
 PAUSA_BUSCA      = 3     # segundos entre buscas no ddgs (fallback)
 MIN_INTERVALO_IA = 5     # segundos entre chamadas de IA (respeita free tier)
@@ -385,53 +385,71 @@ def chamar_groq(prompt):
     return resp.choices[0].message.content
 
 
-def extrair_shows_ia(nome, candidatos):
-    """Extrai shows via IA. Backoff CURTO e desiste sem travar a execucao."""
+def _parse_saida_ia(texto):
+    """Converte a resposta da IA em lista de shows, tolerando ruido/markdown."""
+    texto = (texto or "").strip()
+    if texto.startswith("```"):
+        texto = "\n".join(texto.split("\n")[1:-1]).strip()
+    if not texto or texto == "[]":
+        return []
+    try:
+        shows = json.loads(texto)
+    except json.JSONDecodeError:
+        m = re.search(r"\[.*\]", texto, re.DOTALL)
+        if not m:
+            return []
+        try:
+            shows = json.loads(m.group())
+        except Exception:
+            return []
+    return shows if isinstance(shows, list) else []
+
+
+def _eh_rate_limit(e):
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        if e.response.status_code == 429:
+            return True
+    msg = str(e).lower()
+    return "429" in msg or "rate" in msg or "quota" in msg or "resource_exhausted" in msg
+
+
+def extrair_shows_ia(nome, candidatos, estado_ia):
+    """
+    Extrai shows via IA com FALLBACK de provedor: Gemini -> Groq.
+    Se o Gemini estourar a cota (rate limit), marca-o como esgotado e passa a
+    usar o Groq no restante da execucao — em vez de deixar todos os proximos
+    artistas sem IA (foi o que aconteceu antes, a partir do artista 22).
+    Nunca trava: em ultimo caso, desiste do artista.
+    """
     if not candidatos:
         return []
     prompt = montar_prompt(nome, candidatos)
-    usar_gemini = bool(GEMINI_API_KEY)
-    texto = ""
 
-    for tentativa in range(1, MAX_RETRIES_IA + 1):
-        try:
-            texto = chamar_gemini(prompt) if usar_gemini else chamar_groq(prompt)
-            texto = (texto or "").strip()
-            if texto.startswith("```"):
-                texto = "\n".join(texto.split("\n")[1:-1]).strip()
-            if not texto or texto == "[]":
-                return []
-            shows = json.loads(texto)
-            return shows if isinstance(shows, list) else []
+    provedores = []
+    if estado_ia.get("gemini_ok") and GEMINI_API_KEY:
+        provedores.append("gemini")
+    if GROQ_API_KEY:
+        provedores.append("groq")
+    if not provedores and GEMINI_API_KEY:   # sem Groq configurado, insiste no Gemini
+        provedores.append("gemini")
 
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else 0
-            if code == 429:
-                if tentativa >= MAX_RETRIES_IA:
-                    print("(IA rate limit: pulando)", end="", flush=True)
-                    return []          # desiste do artista, NAO trava a execucao
-                time.sleep(8 * tentativa)   # 8s, 16s — curto
-                continue
-            if usar_gemini and GROQ_API_KEY:   # Gemini falhou -> cai pro Groq
-                usar_gemini = False
-                continue
-            return []
-
-        except json.JSONDecodeError:
-            m = re.search(r"\[.*\]", texto, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group())
-                except Exception:
+    for prov in provedores:
+        for tentativa in range(1, MAX_RETRIES_IA + 1):
+            try:
+                texto = chamar_gemini(prompt) if prov == "gemini" else chamar_groq(prompt)
+                return _parse_saida_ia(texto)
+            except Exception as e:
+                if _eh_rate_limit(e):
+                    if prov == "gemini":
+                        estado_ia["gemini_ok"] = False   # cota diaria -> nao insiste
+                        print("(Gemini sem cota -> Groq)", end="", flush=True)
+                        break                            # troca de provedor
+                    if tentativa < MAX_RETRIES_IA:
+                        time.sleep(6 * tentativa)        # Groq: backoff curto
+                        continue
+                    print("(Groq rate limit: pulando)", end="", flush=True)
                     return []
-            return []
-
-        except Exception:
-            if usar_gemini and GROQ_API_KEY:
-                usar_gemini = False
-                continue
-            return []
-
+                break   # erro nao relacionado a cota -> tenta o proximo provedor
     return []
 
 
@@ -489,7 +507,14 @@ def main():
     print("=" * 64)
     print("  ROBO DE SHOWS v2 — PASSO 2: descoberta multi-fonte")
     print(f"  Somente shows futuros a partir de {HOJE_STR}")
-    ia = "Gemini (%s)" % GEMINI_MODEL if GEMINI_API_KEY else ("Groq llama-3.3" if GROQ_API_KEY else "NENHUMA")
+    if GEMINI_API_KEY and GROQ_API_KEY:
+        ia = f"Gemini ({GEMINI_MODEL}) com fallback Groq"
+    elif GEMINI_API_KEY:
+        ia = f"Gemini ({GEMINI_MODEL})"
+    elif GROQ_API_KEY:
+        ia = "Groq llama-3.3"
+    else:
+        ia = "NENHUMA"
     print(f"  IA: {ia}")
     if usar_cse:
         print(f"  Busca: Google (top {NUM_ARTISTAS_GOOGLE} artistas) + ddgs (demais)")
@@ -518,6 +543,7 @@ def main():
     print(f"  {len(artistas)} artistas na fila\n")
 
     estado = {"usar_cse": usar_cse, "budget": CSE_ORCAMENTO_DIARIO}
+    estado_ia = {"gemini_ok": bool(GEMINI_API_KEY)}
     todos = []
     inicio = time.monotonic()
     interrompido = False
@@ -537,7 +563,7 @@ def main():
             candidatos, motor = coletar_candidatos(nome, i, ddgs, estado)
             corpus = " ".join(f"{c['titulo']} {c['snippet']} {c['link']}" for c in candidatos)
 
-            shows_web = validar(extrair_shows_ia(nome, candidatos), corpus) if candidatos else []
+            shows_web = validar(extrair_shows_ia(nome, candidatos, estado_ia), corpus) if candidatos else []
             shows_bt  = validar(shows_bt, corpus)
 
             achados = deduplicar(shows_bt + shows_web)
