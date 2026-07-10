@@ -1,0 +1,26 @@
+name: Debug Grounding
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Teste Gemini grounding (Google Search)
+        run: |
+          KEY=$(printf '%s' "${{ secrets.GEMINI_API_KEY }}" | tr -d '[:space:]')
+          cat > body.json <<'JSON'
+          {
+            "contents": [{"parts":[{"text":"Liste os proximos shows do artista Thiago Espirito Santo na cidade de Sao Paulo, com data no formato DD/MM/AAAA, local e link de ingresso. Considere shows futuros a partir de julho de 2026. Use a busca do Google para responder."}]}],
+            "tools": [{"google_search": {}}]
+          }
+          JSON
+          for MODEL in gemini-2.5-flash gemini-2.0-flash; do
+            echo "===================== MODELO: $MODEL ====================="
+            code=$(curl -s -o resp.json -w "%{http_code}" -H "Content-Type: application/json" -X POST "https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent?key=$KEY" -d @body.json)
+            echo "HTTP_STATUS=$code"
+            echo "----- texto -----"
+            python3 -c "import json;d=json.load(open('resp.json'));c=d.get('candidates',[{}])[0];print(c.get('content',{}).get('parts',[{}])[0].get('text','(sem texto)'));print('--- grounding usado:', 'sim' if c.get('groundingMetadata') else 'nao')" 2>/dev/null || (echo "(parse falhou) corpo:"; head -c 600 resp.json)
+            echo ""
+          done
