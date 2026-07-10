@@ -31,8 +31,6 @@ jobs:
           echo "SPOTIFY_CLIENT_ID=${{ secrets.SPOTIFY_CLIENT_ID }}" >> .env
           echo "SPOTIFY_CLIENT_SECRET=${{ secrets.SPOTIFY_CLIENT_SECRET }}" >> .env
           echo "SPOTIFY_REDIRECT_URI=${{ secrets.SPOTIFY_REDIRECT_URI }}" >> .env
-          echo "GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}" >> .env
-          echo "GOOGLE_CSE_ID=${{ secrets.GOOGLE_CSE_ID }}" >> .env
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
           echo "GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}" >> .env
           echo "BANDSINTOWN_APP_ID=${{ secrets.BANDSINTOWN_APP_ID }}" >> .env
@@ -42,7 +40,7 @@ jobs:
       - name: Passo 1 - Buscar artistas do Spotify
         run: python passo1_spotify.py
 
-      - name: Passo 2 - Buscar shows (multi-fonte + IA)
+      - name: Passo 2 - Buscar shows (Gemini grounding + ddgs)
         run: python passo2_buscar_shows.py
 
       - name: Passo 3 - Enviar notificacoes no Telegram
