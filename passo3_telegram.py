@@ -17,6 +17,7 @@ Como rodar:
 
 import os
 import json
+import time
 import hashlib
 import requests
 from datetime import datetime, date, timedelta
@@ -159,8 +160,14 @@ def normalizar(texto):
 
 # ─── Envio via Telegram ───────────────────────────────────────────────────────
 
-def enviar_mensagem(texto, parse_mode="Markdown"):
-    """Envia uma mensagem via Telegram Bot API."""
+def enviar_mensagem(texto, parse_mode="Markdown", tentativas=3):
+    """
+    Envia uma mensagem via Telegram Bot API.
+
+    Tolera instabilidade de rede: em timeout ou erro de conexão, tenta de novo
+    com espera progressiva. Um ReadTimeout de 10s derrubou a execução de
+    02/09/2026 e fez a notificação daquele dia se perder.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id":    TELEGRAM_CHAT_ID,
@@ -168,9 +175,23 @@ def enviar_mensagem(texto, parse_mode="Markdown"):
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
-    resp = requests.post(url, json=payload, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            ultimo_erro = e
+            if tentativa < tentativas:
+                espera = 5 * tentativa          # 5s, depois 10s
+                print(f"   ⏳ Instabilidade no Telegram ({type(e).__name__}). "
+                      f"Nova tentativa em {espera}s...")
+                time.sleep(espera)
+
+    raise ultimo_erro
 
 
 def enviar_shows(shows_novos):
@@ -299,6 +320,10 @@ def main():
 
     except requests.exceptions.ConnectionError:
         print("\n❌ Sem conexão com a internet. Tente novamente.")
+
+    except requests.exceptions.Timeout as e:
+        print(f"\n❌ Telegram não respondeu mesmo após as retentativas: {e}")
+        print("   Os shows não notificados continuam pendentes para a próxima execução.")
 
 
 if __name__ == "__main__":
