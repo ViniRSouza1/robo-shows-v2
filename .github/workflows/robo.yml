@@ -40,9 +40,26 @@ jobs:
           echo "BANDSINTOWN_APP_ID=${{ secrets.BANDSINTOWN_APP_ID }}" >> .env
           echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
           echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          echo "SPOTIFY_TOKEN_DATA=${{ vars.SPOTIFY_TOKEN_DATA }}" >> .env
+
+      # Restaura a ultima lista de artistas obtida com sucesso. Se o Spotify
+      # falhar (ex.: acesso expirado), o Passo 1 segue com ela em vez de parar.
+      - name: Restaurar ultima lista de artistas
+        uses: actions/cache/restore@v4
+        with:
+          path: artistas_fallback.json
+          key: artistas-${{ github.run_id }}
+          restore-keys: artistas-
 
       - name: Passo 1 - Buscar artistas do Spotify
         run: python passo1_spotify.py
+
+      - name: Salvar lista de artistas para os proximos dias
+        if: always() && hashFiles('artistas_fallback.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: artistas_fallback.json
+          key: artistas-${{ github.run_id }}
 
       - name: Passo 2 - Buscar shows (Gemini grounding + ddgs)
         run: python passo2_buscar_shows.py

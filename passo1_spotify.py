@@ -23,8 +23,13 @@ Como rodar:
 """
 
 import os
+import sys
 import json
 import time
+import shutil
+from datetime import date, datetime
+
+import requests
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -36,6 +41,21 @@ load_dotenv()
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+# Desde 20/07/2026 o Spotify expira o acesso (refresh token) a cada 6 meses,
+# exigindo nova autorização. Foi isso que parou o robô em 02/10/2026.
+# SPOTIFY_TOKEN_DATA (AAAA-MM-DD) é gravada pelo renovar_spotify.py e permite
+# avisar no Telegram antes de vencer.
+SPOTIFY_TOKEN_DATA  = os.getenv("SPOTIFY_TOKEN_DATA", "").strip()
+VALIDADE_TOKEN_DIAS = 182
+AVISAR_A_PARTIR_DE  = 165   # dias; avisa às segundas, e todo dia na última semana
+
+# Última lista de artistas obtida com sucesso. Se o Spotify falhar, o robô segue
+# com ela em vez de parar (no GitHub Actions ela é preservada via actions/cache).
+FALLBACK_FILE = "artistas_fallback.json"
 
 # Quantos artistas buscar por janela de tempo (máx: 50)
 TOP_POR_JANELA = 50
@@ -249,6 +269,76 @@ def exibir_resumo(artistas):
     print("  ★ = artista do histórico de reprodução")
 
 
+# ─── Avisos e fallback ────────────────────────────────────────────────────────
+
+def avisar_telegram(texto):
+    """Envia um aviso operacional. Nunca derruba o passo se o Telegram falhar."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for tentativa in range(1, 4):
+        try:
+            r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": texto},
+                              timeout=30)
+            r.raise_for_status()
+            return
+        except Exception as e:
+            print(f"   ⚠ Aviso no Telegram falhou ({type(e).__name__}), tentativa {tentativa}/3")
+            time.sleep(5 * tentativa)
+
+
+def verificar_validade_token():
+    """Avisa no Telegram quando o acesso ao Spotify estiver perto de vencer."""
+    if not SPOTIFY_TOKEN_DATA:
+        return
+    try:
+        emitido = datetime.strptime(SPOTIFY_TOKEN_DATA, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"   ⚠ SPOTIFY_TOKEN_DATA inválida: {SPOTIFY_TOKEN_DATA!r}")
+        return
+
+    dias = (date.today() - emitido).days
+    restantes = VALIDADE_TOKEN_DIAS - dias
+    print(f"  🔑 Acesso ao Spotify emitido há {dias} dias (~{restantes} restantes)")
+
+    ultima_semana = restantes <= 7
+    if dias >= AVISAR_A_PARTIR_DE and (date.today().weekday() == 0 or ultima_semana):
+        avisar_telegram(
+            "🔑 Robô de Shows: o acesso ao Spotify vence em "
+            f"~{max(restantes, 0)} dia(s) (o Spotify exige renovar a cada 6 meses).\n\n"
+            "Para renovar, rode no seu computador, na pasta robo-shows-v2:\n"
+            "python renovar_spotify.py"
+        )
+
+
+def usar_fallback(erro):
+    """Spotify indisponível: avisa e segue com a última lista conhecida."""
+    print(f"\n❌ Falha ao acessar o Spotify: {type(erro).__name__}: {erro}")
+
+    expirou = "invalid_grant" in str(erro) or "revoked" in str(erro).lower()
+    motivo = ("o acesso ao Spotify expirou (o Spotify exige renovar a cada 6 meses)"
+              if expirou else f"o Spotify retornou erro ({type(erro).__name__})")
+
+    if os.path.exists(FALLBACK_FILE):
+        shutil.copyfile(FALLBACK_FILE, OUTPUT_FILE)
+        print(f"↪ Usando a última lista de artistas salva ({FALLBACK_FILE}).")
+        avisar_telegram(
+            f"⚠️ Robô de Shows: {motivo}.\n\n"
+            "Hoje usei a última lista de artistas salva, então a busca de shows "
+            "continua normalmente.\n\n"
+            "Para renovar, rode no seu computador, na pasta robo-shows-v2:\n"
+            "python renovar_spotify.py"
+        )
+        return True
+
+    avisar_telegram(
+        f"🛑 Robô de Shows PAROU: {motivo} e não há lista de artistas salva.\n\n"
+        "Para renovar, rode no seu computador, na pasta robo-shows-v2:\n"
+        "python renovar_spotify.py"
+    )
+    return False
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -258,17 +348,29 @@ def main():
     print("=" * 55)
     print()
 
-    sp = criar_cliente()
+    verificar_validade_token()
 
-    usuario = sp.current_user()
+    try:
+        sp = criar_cliente()
+        usuario = sp.current_user()
+    except Exception as e:
+        if usar_fallback(e):
+            return
+        sys.exit(1)
+
     print(f"✅ Conectado como: {usuario['display_name']} ({usuario['id']})\n")
 
-    # Busca artistas do histórico (3 janelas de tempo)
-    artistas_info, scores = consolidar_artistas(sp)
-    print(f"\n  → {len(artistas_info)} artistas únicos no histórico de reprodução")
+    try:
+        # Busca artistas do histórico (3 janelas de tempo)
+        artistas_info, scores = consolidar_artistas(sp)
+        print(f"\n  → {len(artistas_info)} artistas únicos no histórico de reprodução")
 
-    # Complementa com curtidas
-    artistas_curtidas = buscar_artistas_de_curtidas(sp, total=200)
+        # Complementa com curtidas
+        artistas_curtidas = buscar_artistas_de_curtidas(sp, total=200)
+    except Exception as e:
+        if usar_fallback(e):
+            return
+        sys.exit(1)
 
     # Monta lista final
     lista_final, complementos = montar_lista_final(
@@ -286,9 +388,13 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(lista_final, f, ensure_ascii=False, indent=2)
 
-    print(f"\n💾 Artistas salvos em: {OUTPUT_FILE}")
+    # Cópia de segurança: usada se o Spotify falhar num dia futuro
+    if lista_final:
+        shutil.copyfile(OUTPUT_FILE, FALLBACK_FILE)
+
+    print(f"\n💾 Artistas salvos em: {OUTPUT_FILE} (cópia de segurança em {FALLBACK_FILE})")
     print("\n✅ Passo 1 concluído!")
-    print("   Próximo: rode o passo2_ia.py para buscar shows.\n")
+    print("   Próximo: rode o passo2_buscar_shows.py para buscar shows.\n")
 
 
 if __name__ == "__main__":
